@@ -174,9 +174,8 @@ class ISDMapEstimator:
             Normalized ISD map of shape (H, W, 3) in float32.
         """
         # image = self._reshape_image(image)
-        input_tensor = self._preprocess_image(image, log=False)
-
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              with torch.no_grad():
+        input_tensor = self._preprocess_image(image, log=False) 
+        with torch.no_grad():
             output = self.model(input_tensor)
 
         output_np = output.squeeze(0).permute(1, 2, 0).cpu().numpy()

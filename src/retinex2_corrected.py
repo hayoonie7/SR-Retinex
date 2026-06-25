@@ -81,6 +81,19 @@ def shift2d_reflect(a: np.ndarray, dy: int, dx: int) -> np.ndarray:
     x0 = pad_x + dx
     return ap[y0:y0 + H, x0:x0 + W]
 
+def shift2d_reflect_rgb(a: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    """Shift (H,W,3) image by (dy,dx) with reflect padding, keeping shape."""
+    H, W, C = a.shape
+    pad_y = abs(dy)
+    pad_x = abs(dx)
+    if pad_y == 0 and pad_x == 0:
+        return a.copy()
+
+    ap = np.pad(a, ((pad_y, pad_y), (pad_x, pad_x), (0, 0)), mode="reflect")
+    y0 = pad_y + dy
+    x0 = pad_x + dx
+    return ap[y0:y0 + H, x0:x0 + W, :]
+
 def gamma_correct_16bit(image: np.ndarray, gamma: float = 2.2, preserve_dtype: bool = True) -> np.ndarray:
     """
     Apply standard gamma correction to a 16-bit linear image.
@@ -258,9 +271,164 @@ class RecursiveRetinexParams:
     weight_eps: float = 1e-6  # ONLY for weights to avoid division by zero (not for log)
 
 
+def isd_projected_intensity(img_rgb: np.ndarray, isd_map: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """
+    Project RGB onto the local ISD direction to get an illumination-sensitive
+    intensity that suppresses cross-ISD material changes.
+    """
+    n = np.linalg.norm(isd_map, axis=2, keepdims=True)
+    unit_isd = isd_map / np.maximum(n, eps)
+    # Per-pixel dot product: (H,W,3) · (H,W,3) -> (H,W)
+    S = np.sum(img_rgb * unit_isd, axis=2)
+    return np.maximum(S, 0.0).astype(np.float32)
+
+# def recursive_retinex(
+#     S: np.ndarray,
+#     S_init: np.ndarray,
+#     params: RecursiveRetinexParams = RecursiveRetinexParams(),
+# ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+#     """
+#     Perform Recursive Retinex illumination–reflectance decomposition
+#     using the multi-scale update formulation of Zhang et al. (ICWAPR 2011).
+
+#     This implementation operates on a single-channel intensity image and
+#     estimates a smooth illumination field in the log domain via iterative
+#     weighted neighbor interactions across multiple spatial scales.
+
+#     The model assumes:
+#         S(x, y) = L(x, y) * R(x, y)
+
+#     In log space:
+#         s = l + r
+
+#     where:
+#         s = log(S)
+#         l = log(L)  (illumination)
+#         r = log(R)  (reflectance)
+
+#     The illumination estimate `l` is obtained recursively by combining:
+#         • a data-fidelity term (agreement with original log intensity s)
+#         • a spatial smoothness term (agreement with neighbors at distance d)
+
+#     For each spatial scale d = 2^level:
+#         term1 = (β * l + s) / (1 + β)
+#         term2 = (β * d * l + D) / (1 + β * d)
+
+#     The final update is a weighted average of the minimum of these terms,
+#     where weights are inversely proportional to squared illumination differences:
+
+#         w_i = 1 / ((D - l)^2 + weight_eps)
+
+#     The algorithm proceeds from coarse to fine scales.
+
+#     Parameters
+#     ----------
+#     S : np.ndarray
+#         2D non-negative intensity image (H, W).
+#         Typically luma derived from RGB. Must be >= 0.
+#         Zero values are handled via zero-masked log (no epsilon added).
+
+#     params : RecursiveRetinexParams
+#         Configuration parameters controlling:
+#             beta              → smoothness vs data fidelity balance
+#             n_levels          → number of spatial scales
+#             iters_per_level   → iterations per scale
+#             weight_eps        → numerical stability constant
+
+#     Returns
+#     -------
+#     l_log : np.ndarray
+#         Log-domain illumination estimate (H, W).
+
+#     r_log : np.ndarray
+#         Log-domain reflectance estimate (H, W).
+
+#     L_lin : np.ndarray
+#         Linear-domain illumination field:
+#             L = exp(l_log)
+
+#     R_lin : np.ndarray
+#         Linear-domain reflectance field:
+#             R = exp(r_log)
+#     """
+#     if S.ndim != 2:
+#         raise ValueError("S must be 2D (H,W).")
+#     if np.any(S < 0):
+#         raise ValueError("S must be nonnegative.")
+
+#     beta = float(params.beta)
+#     w_eps = float(params.weight_eps)
+
+#     S = S.astype(np.float32)
+
+#     s_isd = np.zeros_like(S, dtype=np.float32)
+#     mS = S > 0
+#     s_isd[mS] = np.log(S[mS])
+
+#     s_luma = np.zeros_like(S_init, dtype=np.float32)
+#     mL = S_init > 0
+#     s_luma[mL] = np.log(S_init[mL])
+
+#     l = s_luma.copy()
+#     s = s_isd
+
+#     H, W = S.shape
+#     max_dim = max(H, W)
+
+#     if params.n_levels is None:
+#         n_levels = int(np.floor(np.log2(max_dim))) + 1
+#     else:
+#         n_levels = int(params.n_levels)
+
+#     iters_per_level = int(params.iters_per_level)
+
+#     dirs = [(-1, 0), (1, 0), (0, -1), (0, 1),
+#             (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+#     for level in reversed(range(n_levels)):
+#         d = 2 ** level
+#         if d <= 0:
+#             continue
+
+#         for _ in range(iters_per_level):
+#             m_list = []
+#             w_list = []
+
+#             term1 = (l * beta + s) / (1.0 + beta)
+
+#             for dy, dx in dirs:
+#                 D = shift2d_reflect(l, dy * d, dx * d)
+
+#                 term2 = (l * beta * d + D) / (1.0 + beta * d)
+#                 m_i = np.minimum(term1, term2)
+
+#                 w_i = 1.0 / ((D - l) ** 2 + w_eps)
+
+#                 m_list.append(m_i)
+#                 w_list.append(w_i)
+
+#             m_stack = np.stack(m_list, axis=0)
+#             w_stack = np.stack(w_list, axis=0)
+
+#             num = np.sum(w_stack * m_stack, axis=0)
+#             den = np.sum(w_stack, axis=0)
+
+#             l = num / (den + w_eps)
+
+#     r = s - l
+#     L = np.exp(l).astype(np.float32)
+#     R = np.exp(r).astype(np.float32)
+#     return l.astype(np.float32), r.astype(np.float32), L, R
+
+
 def recursive_retinex(
     S: np.ndarray,
+    S_init: np.ndarray,
     params: RecursiveRetinexParams = RecursiveRetinexParams(),
+    img_rgb: np.ndarray | None = None,
+    isd_map: np.ndarray | None = None,
+    isd_threshold: float = 0.0,
+    grad_threshold: float = 0.0
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Perform Recursive Retinex illumination–reflectance decomposition
@@ -336,11 +504,16 @@ def recursive_retinex(
 
     S = S.astype(np.float32)
 
-    s = np.zeros_like(S, dtype=np.float32)
+    s_isd = np.zeros_like(S, dtype=np.float32)
     mS = S > 0
-    s[mS] = np.log(S[mS])
+    s_isd[mS] = np.log(S[mS])
 
-    l = s.copy()
+    s_luma = np.zeros_like(S_init, dtype=np.float32)
+    mL = S_init > 0
+    s_luma[mL] = np.log(S_init[mL])
+
+    l = s_luma.copy()
+    s = s_isd
 
     H, W = S.shape
     max_dim = max(H, W)
@@ -355,12 +528,18 @@ def recursive_retinex(
     dirs = [(-1, 0), (1, 0), (0, -1), (0, 1),
             (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
+    use_gate = (img_rgb is not None) and (isd_map is not None)
+    if use_gate:
+        n = np.linalg.norm(isd_map, axis=2, keepdims=True)
+        unit_isd = isd_map / np.maximum(n, w_eps)
+
     for level in reversed(range(n_levels)):
         d = 2 ** level
         if d <= 0:
             continue
 
         for _ in range(iters_per_level):
+            l_prev = l.copy()
             m_list = []
             w_list = []
 
@@ -369,13 +548,24 @@ def recursive_retinex(
             for dy, dx in dirs:
                 D = shift2d_reflect(l, dy * d, dx * d)
 
+                if use_gate:
+                    dI = shift2d_reflect_rgb(img_rgb, dy * d, dx * d) - img_rgb
+                    dI_norm = np.linalg.norm(dI, axis=2)
+                    unit_dI = dI / np.maximum(dI_norm[..., None], w_eps)
+                    cos_sim = np.sum(unit_dI * unit_isd, axis=2)
+                    gate = ((cos_sim >= isd_threshold) & (dI_norm > grad_threshold)).astype(np.float32)
+                    gate_fraction = gate.mean()
+                    print(f"Level {level}, dir ({dy},{dx}): gate fraction = {gate_fraction:.3f}")
+                else:
+                    gate = 1.0
+            
                 term2 = (l * beta * d + D) / (1.0 + beta * d)
                 m_i = np.minimum(term1, term2)
 
                 w_i = 1.0 / ((D - l) ** 2 + w_eps)
 
-                m_list.append(m_i)
-                w_list.append(w_i)
+                m_list.append(m_i * gate)
+                w_list.append(w_i * gate)
 
             m_stack = np.stack(m_list, axis=0)
             w_stack = np.stack(w_list, axis=0)
@@ -383,13 +573,16 @@ def recursive_retinex(
             num = np.sum(w_stack * m_stack, axis=0)
             den = np.sum(w_stack, axis=0)
 
-            l = num / (den + w_eps)
+            update_mask = den > 1e-4
+            print(f"update_mask fraction: {update_mask.mean():.3f}")
+            l_new = num / (den + w_eps)
+            l = np.where(update_mask, l_new, l_prev)
+            #l = num / (den + w_eps)
 
     r = s - l
     L = np.exp(l).astype(np.float32)
     R = np.exp(r).astype(np.float32)
     return l.astype(np.float32), r.astype(np.float32), L, R
-
 
 # -----------------------------
 # ISD equalization
@@ -473,7 +666,7 @@ def equalize_illumination_along_isd(
     L_n = np.clip(L_n, 1e-3, 10.0)
 
     alpha, dbg = alpha_from_gamma_tonecurve_on_illumination(
-                                                        L, 
+                                                        L_n, 
                                                         only_brighten=only_brighten, 
                                                         gamma=gamma)
 
@@ -550,7 +743,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--weight_eps", type=float, default=1e-6, help="Stability eps for weights/denominator only.")
     p.add_argument("--iters_per_level", type=int, default=1, help="Iterations per distance level.")
     p.add_argument("--n_levels", type=int, default=0, help="Number of levels. 0 means auto from image size.")
-    p.add_argument("--mode", type=str, default="luma", choices=["luma", "channel"], 
+    p.add_argument("--mode", type=str, default="luma", choices=["luma", "channel", "isd"], 
                         help="How to compute intensity S for Retinex.")
     p.add_argument("--channel", type=int, default=2, help="If mode=channel, which channel index 0/1/2.")
     p.add_argument("--max_abs_alpha", type=float, default=0.4, help="Clamp for ISD shift (normalized-log units).")
@@ -594,6 +787,23 @@ def main() -> None:
         )
     save_image_float(str(out_dir / "original_linear.png"), img_bgr)
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    MAX_SIZE = 512
+
+    h, w = img_rgb.shape[:2]
+
+    if max(h, w) > MAX_SIZE:
+        scale = MAX_SIZE / max(h, w)
+
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+
+        img_rgb = cv2.resize(
+            img_rgb,
+            (new_w, new_h),
+            interpolation=cv2.INTER_AREA
+        )
+
     img_srgb = linear16_to_srgb(img_rgb)
     save_image_float(str(out_dir / "original_srgb.png"), img_srgb, channel_order='rgb')
 
@@ -621,11 +831,19 @@ def main() -> None:
     # Build intensity S
     if args.mode == "luma":
         S = rgb_to_luma(img_rgb)
+        S = cv2.GaussianBlur(S, (0, 0), sigmaX=1.5)
+        S_luma = S
     elif args.mode == "channel":
         c = int(args.channel)
         if c < 0 or c > 2:
             raise ValueError("--channel must be 0, 1, or 2")
         S = img_rgb[..., c]   
+    elif args.mode == "isd":
+        S = isd_projected_intensity(img_rgb, isd_map_rgb)
+        S = cv2.GaussianBlur(S, (0, 0), sigmaX=1.5)
+
+        S_luma = rgb_to_luma(img_rgb)
+        S_luma = cv2.GaussianBlur(S_luma, (0,0), sigmaX=1.5)
     else:
         raise ValueError(f"Unsupported mode: {args.mode}. Argument 'mode' must be either 'luma' or 'channel.")
 
@@ -637,7 +855,7 @@ def main() -> None:
         weight_eps=args.weight_eps,
     )
 
-    l_log, r_log, L, R = recursive_retinex(S, params)
+    l_log, r_log, L, R = recursive_retinex(S, S_luma, params, img_rgb=None, isd_map=None, isd_threshold=0.3, grad_threshold=0.001)
 
     # Save illumination (visualization)
     L_vis = L / (np.percentile(L, 99.5) + 1e-6)

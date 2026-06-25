@@ -48,3 +48,7 @@ data/chatgpt/
 # README assets
 !docs/readme_assets/
 !docs/readme_assets/*.png
+/retinexnet_env/Lib/site-packages/cv2/gapi
+/retinexnet_env/Lib/site-packages/cv2/detail
+/retinexnet_env/Lib/site-packages/cv2/data
+/retinexnet_env
