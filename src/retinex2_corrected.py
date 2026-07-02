@@ -270,7 +270,7 @@ class RecursiveRetinexParams:
     iters_per_level: int = 1
     weight_eps: float = 1e-6  # ONLY for weights to avoid division by zero (not for log)
     alpha: float = 0.5
-    gate_threshold: float = 0.0  # Cosine similarity threshold for ISD gating (0.0 = no gating)
+    gate_threshold: float = 0.3  # Cosine similarity threshold for ISD gating (0.0 = no gating)
    
 def isd_projected_intensity(img_rgb: np.ndarray, isd_map: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """
@@ -284,6 +284,17 @@ def isd_projected_intensity(img_rgb: np.ndarray, isd_map: np.ndarray, eps: float
     S = np.sum(img_rgb * unit_isd, axis=2)
     return np.maximum(S, 0.0).astype(np.float32)
 
+def apply_darkness_floor(L, S, dark_percentile=20.0):
+    """
+    If the input intensity S is below dark_thresh, force the illumination
+    estimate L down toward floor_value rather than letting it stay high.
+    """
+    dark_thresh = np.percentile(S[S > 0], dark_percentile)
+    mask = (S < dark_thresh) & (S > 0)
+    L_floored = L.copy()
+    L_floored[mask] = np.minimum(L_floored[mask], S[mask])
+    return L_floored
+
 def recursive_retinex(
     S: np.ndarray,
     S_init: np.ndarray,
@@ -292,24 +303,68 @@ def recursive_retinex(
     isd_map: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Recursive Retinex illumination–reflectance decomposition (Zhang et al., ICWAPR 2011)
-    with ISD-based edge gating.
+    Perform Recursive Retinex illumination–reflectance decomposition
+    using the multi-scale update formulation of Zhang et al. (ICWAPR 2011).
 
-    The illumination estimate l is built per spatial scale d = 2^level by combining,
-    for each neighbor direction, a data-fidelity term and a smoothness term:
+    This implementation operates on a single-channel intensity image and
+    estimates a smooth illumination field in the log domain via iterative
+    weighted neighbor interactions across multiple spatial scales.
 
-        term1 = (beta * d * l + s) / (1 + beta * d)        # data fidelity
-        term2 = (beta * d * l + D) / (1 + beta * d)        # smoothness toward neighbor D
+    The model assumes:
+        S(x, y) = L(x, y) * R(x, y)
 
-    The per-direction candidate is a gated blend of these:
+    In log space:
+        s = l + r
 
-        l_i = (max_i + min_i * alpha * gate) / (1 + alpha * gate)
+    where:
+        s = log(S)
+        l = log(L)  (illumination)
+        r = log(R)  (reflectance)
 
-    where gate -> 1 at reflectance edges (pulls l_i toward min_i, suppressing light)
-    and   gate -> 0 at illumination edges (l_i -> max_i, light follows the edge).
+    The illumination estimate `l` is obtained recursively by combining:
+        • a data-fidelity term (agreement with original log intensity s)
+        • a spatial smoothness term (agreement with neighbors at distance d)
 
-    The hard gate marks an edge as illumination (gate 0) when the log-RGB gradient
-    is aligned with the local ISD direction (|cos| > gate_threshold), else reflectance.
+    For each spatial scale d = 2^level:
+        term1 = (β * l + s) / (1 + β)
+        term2 = (β * d * l + D) / (1 + β * d)
+
+    The final update is a weighted average of the minimum of these terms,
+    where weights are inversely proportional to squared illumination differences:
+
+        w_i = 1 / ((D - l)^2 + weight_eps)
+
+    The algorithm proceeds from coarse to fine scales.
+
+    Parameters
+    ----------
+    S : np.ndarray
+        2D non-negative intensity image (H, W).
+        Typically luma derived from RGB. Must be >= 0.
+        Zero values are handled via zero-masked log (no epsilon added).
+
+    params : RecursiveRetinexParams
+        Configuration parameters controlling:
+            beta              → smoothness vs data fidelity balance
+            n_levels          → number of spatial scales
+            iters_per_level   → iterations per scale
+            weight_eps        → numerical stability constant
+
+    Returns
+    -------
+    l_log : np.ndarray
+        Log-domain illumination estimate (H, W).
+
+    r_log : np.ndarray
+        Log-domain reflectance estimate (H, W).
+
+    L_lin : np.ndarray
+        Linear-domain illumination field:
+            L = exp(l_log)
+
+    R_lin : np.ndarray
+        Linear-domain reflectance field:
+            R = exp(r_log)
     """
     if S.ndim != 2:
         raise ValueError("S must be 2D (H,W).")
@@ -326,6 +381,7 @@ def recursive_retinex(
     s[mS] = np.log(S[mS])
 
     l = np.zeros_like(S_init, dtype=np.float32)
+    
     mL = S_init > 0
     l[mL] = np.log(S_init[mL])
 
@@ -366,7 +422,6 @@ def recursive_retinex(
                     dI_norm = np.linalg.norm(dI, axis=2)
                     unit_dI = dI / np.maximum(dI_norm[..., None], w_eps)
                     cos_sim = np.abs(np.sum(unit_dI * unit_isd, axis=2))
-                    # aligned with ISD => illumination edge => gate 0; else reflectance => 1
                     gate = np.where(cos_sim > params.gate_threshold, 0.0, 1.0).astype(np.float32)
                 else:
                     gate = 1.0
@@ -669,10 +724,11 @@ def main() -> None:
         iters_per_level=args.iters_per_level,
         weight_eps=args.weight_eps,
         alpha=0.5,
-        gate_threshold=0.95,
+        gate_threshold=0.3,
     )
     log_img_rgb = linear16_to_log_normalized(img_rgb)  # normalized log in [0,1]
-    l_log, r_log, L, R = recursive_retinex(S, S_luma, params, img_rgb=log_img_rgb, isd_map=isd_map_rgb)
+    l_log, r_log, L, R = recursive_retinex(S, S_luma, params, img_rgb=img_rgb, isd_map=isd_map_rgb)
+    L = apply_darkness_floor(L, S, dark_percentile=20.0)
 
     # Save illumination (visualization)
     L_vis = L / (np.percentile(L, 99.5) + 1e-6)
