@@ -710,7 +710,7 @@ def main() -> None:
     if args.mode == "luma":
         S = rgb_to_luma(img_rgb)
         S = cv2.GaussianBlur(S, (0, 0), sigmaX=1.5)
-        S_ = S
+        S_init = S
     elif args.mode == "channel":
         c = int(args.channel)
         if c < 0 or c > 2:
