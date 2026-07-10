@@ -270,7 +270,9 @@ class RecursiveRetinexParams:
     iters_per_level: int = 1
     weight_eps: float = 1e-6  # ONLY for weights to avoid division by zero (not for log)
     alpha: float = 0.5
-    gate_threshold: float = 0.3  # Cosine similarity threshold for ISD gating (0.0 = no gating)
+    gate_threshold: float = 0.3  
+    grad_threshold: float = 1e2  
+    w_max: float = 1e3  
    
 def isd_projected_intensity(img_rgb: np.ndarray, isd_map: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """
@@ -422,7 +424,8 @@ def recursive_retinex(
                     dI_norm = np.linalg.norm(dI, axis=2)
                     unit_dI = dI / np.maximum(dI_norm[..., None], w_eps)
                     cos_sim = np.abs(np.sum(unit_dI * unit_isd, axis=2))
-                    gate = np.where(cos_sim > params.gate_threshold, 0.0, 1.0).astype(np.float32)
+                    is_edge = dI_norm > params.grad_threshold
+                    gate = np.where(is_edge & (cos_sim > params.gate_threshold), 0.0, 1.0).astype(np.float32)
                 else:
                     gate = 1.0
 
@@ -432,9 +435,13 @@ def recursive_retinex(
 
                 l_i = (max_i + min_i * params.alpha * gate) / (1.0 + params.alpha * gate)
                 w_i = 1.0 / ((D - l) ** 2 + w_eps)
+                w_i = np.minimum(w_i, params.w_max)
 
                 l_list.append(l_i)
                 w_list.append(w_i)
+
+                if level == 0 and (dy, dx) == (0, 1):
+                    cv2.imwrite(f"retinex2_output_isd\\red_square_green\\gate_L0.png", (gate*255).astype(np.uint8))
 
             l_stack = np.stack(l_list, axis=0)
             w_stack = np.stack(w_list, axis=0)
@@ -627,6 +634,7 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
 
+
     if ChromaticityMetrics is None:
         raise ImportError(
             "ChromaticityMetrics is unavailable. Add src/metrics.py "
@@ -702,7 +710,7 @@ def main() -> None:
     if args.mode == "luma":
         S = rgb_to_luma(img_rgb)
         S = cv2.GaussianBlur(S, (0, 0), sigmaX=1.5)
-        S_luma = S
+        S_ = S
     elif args.mode == "channel":
         c = int(args.channel)
         if c < 0 or c > 2:
@@ -711,9 +719,7 @@ def main() -> None:
     elif args.mode == "isd":
         S = isd_projected_intensity(img_rgb, isd_map_rgb)
         S = cv2.GaussianBlur(S, (0, 0), sigmaX=1.5)
-
-        S_luma = rgb_to_luma(img_rgb)
-        S_luma = cv2.GaussianBlur(S_luma, (0,0), sigmaX=1.5)
+        S_init = S.copy()
     else:
         raise ValueError(f"Unsupported mode: {args.mode}. Argument 'mode' must be either 'luma' or 'channel.")
 
@@ -725,9 +731,11 @@ def main() -> None:
         weight_eps=args.weight_eps,
         alpha=0.5,
         gate_threshold=0.3,
+        grad_threshold=1e2,
+        w_max = 1e3
     )
     log_img_rgb = linear16_to_log_normalized(img_rgb)  # normalized log in [0,1]
-    l_log, r_log, L, R = recursive_retinex(S, S_luma, params, img_rgb=img_rgb, isd_map=isd_map_rgb)
+    l_log, r_log, L, R = recursive_retinex(S, S_init, params, img_rgb=log_img_rgb, isd_map=isd_map_rgb)
     L = apply_darkness_floor(L, S, dark_percentile=20.0)
 
     # Save illumination (visualization)
