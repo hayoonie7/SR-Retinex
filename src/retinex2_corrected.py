@@ -270,9 +270,9 @@ class RecursiveRetinexParams:
     iters_per_level: int = 1
     weight_eps: float = 1e-6  # ONLY for weights to avoid division by zero (not for log)
     alpha: float = 0.5
-    gate_threshold: float = 0.3  
-    grad_threshold: float = 1e2  
-    w_max: float = 1e3  
+    gate_threshold: float = 0.3  # Cosine similarity threshold for ISD gating (0.0 = no gating)
+    grad_threshold: float = 0.02  # Gradient magnitude threshold for ISD gating (0.0 = no gating)
+    w_max: float = 1e3  # Maximum weight to avoid numerical issues
    
 def isd_projected_intensity(img_rgb: np.ndarray, isd_map: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """
@@ -284,18 +284,7 @@ def isd_projected_intensity(img_rgb: np.ndarray, isd_map: np.ndarray, eps: float
 
     # Per-pixel dot product: (H,W,3) · (H,W,3) -> (H,W)
     S = np.sum(img_rgb * unit_isd, axis=2)
-    return np.maximum(S, 0.0).astype(np.float32)
-
-def apply_darkness_floor(L, S, dark_percentile=20.0):
-    """
-    If the input intensity S is below dark_thresh, force the illumination
-    estimate L down toward floor_value rather than letting it stay high.
-    """
-    dark_thresh = np.percentile(S[S > 0], dark_percentile)
-    mask = (S < dark_thresh) & (S > 0)
-    L_floored = L.copy()
-    L_floored[mask] = np.minimum(L_floored[mask], S[mask])
-    return L_floored
+    return np.maximum(S, 1e-4).astype(np.float32)   # floor, not zero-clamp
 
 def recursive_retinex(
     S: np.ndarray,
@@ -511,7 +500,7 @@ def equalize_illumination_along_isd(
     L: np.ndarray,           # (H,W) Retinex illumination (linear)
     *,
     only_brighten: bool = True,
-    max_abs_alpha_normlog: float = 0.4,
+    max_abs_alpha_normlog: float = 0.2,
     eps: float = 1e-6,
     gamma = 2.2,
     soften: bool = False,
@@ -676,7 +665,6 @@ def main() -> None:
             (new_w, new_h),
             interpolation=cv2.INTER_AREA
         )
-    
 
     img_srgb = linear16_to_srgb(img_rgb)
     save_image_float(str(out_dir / "original_srgb.png"), img_srgb, channel_order='rgb')
@@ -731,12 +719,12 @@ def main() -> None:
         weight_eps=args.weight_eps,
         alpha=0.5,
         gate_threshold=0.3,
-        grad_threshold=1e2,
+        grad_threshold=0.02,
         w_max = 1e3
     )
+    
     log_img_rgb = linear16_to_log_normalized(img_rgb)  # normalized log in [0,1]
     l_log, r_log, L, R = recursive_retinex(S, S_init, params, img_rgb=log_img_rgb, isd_map=isd_map_rgb)
-    L = apply_darkness_floor(L, S, dark_percentile=20.0)
 
     # Save illumination (visualization)
     L_vis = L / (np.percentile(L, 99.5) + 1e-6)
